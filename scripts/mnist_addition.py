@@ -1,6 +1,7 @@
 import numpy as np
 import numpy.random as npr
 
+import os
 import itertools
 import random
 import z3
@@ -316,6 +317,8 @@ def train(model, optimizer, train_load, test_load, epochs,
     return train_acc, test_acc, sum(times)/float(len(times))
 
 @click.command()
+@click.option('--model', type=click.Choice(['smt', 'baseline']), default='smt', show_default=True,
+              help='Model to train.')
 @click.option('--lr', default=1., show_default=True, help='Learning rate.')
 @click.option('--pretrain_epochs', default=0, show_default=True, help='Number of pretraining epochs.')
 @click.option('--pct', default=10, show_default=True, help='% pairs to use in training data.')
@@ -325,7 +328,11 @@ def train(model, optimizer, train_load, test_load, epochs,
 @click.option('--clip_norm', default=0.1, show_default=True, help='Gradient clipping norm.')
 @click.option('--maxsat_forward', is_flag=True, show_default=True, help='Maxsat forward pass.')
 @click.option('--maxsat_backward', is_flag=True, show_default=True, help='Maxsat backward pass.')
+@click.option('--seed', default=0, show_default=True, help='Random seed.')
+@click.option('--checkpoint_dir', default='checkpoints', show_default=True,
+              help='Directory for trained model checkpoints.')
 def main(
+    model='smt',
     lr=1.,
     pretrain_epochs=0,
     pct=10,
@@ -334,8 +341,16 @@ def main(
     trials=1,
     clip_norm=0.1,
     maxsat_forward=False,
-    maxsat_backward=False
+    maxsat_backward=False,
+    seed=0,
+    checkpoint_dir='checkpoints'
 ):
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     test_label_pairs = list(itertools.product(list(range(0,10)), repeat=2))
     if pct <= 10:
@@ -355,35 +370,63 @@ def main(
     test_accs = []
     times = []
 
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     for i in range(trials):
-        model = MNISTAdder(use_maxsmt=maxsat_backward).to(DEVICE)
-        optimizer = optim.SGD([{'params': model.parameters(), 'lr': lr, 'momentum': 0.9, 'nesterov': True}])
+        model_instance = MNISTAdder(
+            use_maxsmt=maxsat_backward if model == 'smt' else False
+        ).to(DEVICE)
+        optimizer = optim.SGD([{'params': model_instance.parameters(), 'lr': lr, 'momentum': 0.9, 'nesterov': True}])
         sched = torch.optim.lr_scheduler.OneCycleLR(optimizer, 
                                                     lr, 
                                                     epochs=epochs, 
                                                     steps_per_epoch=len(train_load), 
-                                                    pct_start=1./float(epochs))
+                                                    pct_start=min(0.99, 1./float(epochs)))
 
-        pretrain(model, optimizer, train_load, pretrain_epochs, clip_norm=clip_norm)
+        pretrain(model_instance, optimizer, train_load, pretrain_epochs, clip_norm=clip_norm)
         train_acc, test_acc, elapsed = train(
-            model, optimizer, train_load, test_load, epochs,
+            model_instance, optimizer, train_load, test_load, epochs,
+            use_satlayer=model == 'smt',
             clip_norm=clip_norm, sched=sched, do_sched_batch=True,
-            do_maxsat_forward=maxsat_forward
+            do_maxsat_forward=maxsat_forward if model == 'smt' else False
         )
 
         train_accs.append(train_acc)
         test_accs.append(test_acc)
         times.append(elapsed)
 
-        print('\n[{} of {}]: train={:.4}, test={:.4}, time={:.4}\n'.format(i + 1, trials, train_acc, test_acc, elapsed))
+        checkpoint_path = os.path.join(
+            checkpoint_dir,
+            'mnist_addition_{}_pct{}_seed{}_trial{}.pt'.format(model, pct, seed, i + 1)
+        )
+        torch.save({
+            'model_state': model_instance.state_dict(),
+            'model_type': model,
+            'seed': seed,
+            'pct': pct,
+            'epochs': epochs,
+            'pretrain_epochs': pretrain_epochs,
+            'batch_size': batch_size,
+            'lr': lr,
+            'clip_norm': clip_norm,
+            'maxsat_forward': maxsat_forward if model == 'smt' else False,
+            'maxsat_backward': maxsat_backward if model == 'smt' else False,
+            'train_accuracy': float(train_acc),
+            'test_accuracy': float(test_acc),
+            'epoch_time': float(elapsed),
+            'device': str(DEVICE),
+        }, checkpoint_path)
+
+        print('\n[{} of {}]: train={:.4}, test={:.4}, time={:.4}, checkpoint={}\n'.format(
+            i + 1, trials, train_acc, test_acc, elapsed, checkpoint_path))
         print('-'*20)
 
     train_accs = np.array(train_accs)
     test_accs = np.array(test_accs)
     times = np.array(times)
 
-    print('\nsmt pct={} stats: train={:.4} ({:.8}), test={:.4} ({:.8}), time={:.4} ({:.8})'.format(
-            pct, train_accs.mean(), train_accs.std(), test_accs.mean(), test_accs.std(), times.mean(), times.std()))
+    print('\n{} pct={} stats: train={:.4} ({:.8}), test={:.4} ({:.8}), time={:.4} ({:.8})'.format(
+        model, pct, train_accs.mean(), train_accs.std(), test_accs.mean(), test_accs.std(), times.mean(), times.std()))
 
 if __name__ == '__main__':
     main()
