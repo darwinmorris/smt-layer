@@ -4,7 +4,6 @@ import itertools
 import os
 import sys
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torchvision
@@ -12,6 +11,7 @@ import torchvision
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.mnist_addition import MNISTAdder
+from abcrown import ABCrownSolver, ConfigBuilder, IOConstraints, input_vars, output_vars
 
 
 class PairModel(nn.Module):
@@ -60,33 +60,16 @@ def load_test_examples(count):
     return torch.stack([item[0] for item in examples]), [item[1] for item in examples]
 
 
-def bounds_for_inputs(prefix, images, eps):
-    try:
-        from auto_LiRPA import BoundedModule, BoundedTensor, PerturbationLpNorm
-    except ImportError as error:
-        raise RuntimeError(
-            'auto_LiRPA is required. Use an alpha-beta-CROWN environment '
-            '(typically Python 3.10 or 3.11) and install its pinned '
-            'dependencies before running verification.'
-        ) from error
-
-    bounded_prefix = BoundedModule(
-        prefix,
-        torch.zeros_like(images[:1]),
-        device='cpu',
+def solver_constraints(images, eps, input_vars, output_vars, IOConstraints, output_constraint=None):
+    lower = torch.clamp(images - eps, 0.0, 1.0)
+    upper = torch.clamp(images + eps, 0.0, 1.0)
+    input_constraint = (input_vars >= lower) & (input_vars <= upper)
+    return IOConstraints(
+        input_vars=input_vars,
+        output_vars=output_vars,
+        input_constraint=input_constraint,
+        output_constraint=output_constraint,
     )
-    perturbation = PerturbationLpNorm(
-        norm=np.inf,
-        eps=eps,
-        x_L=torch.clamp(images - eps, 0.0, 1.0),
-        x_U=torch.clamp(images + eps, 0.0, 1.0),
-    )
-    bounded_images = BoundedTensor(images, perturbation)
-    lower, upper = bounded_prefix.compute_bounds(
-        x=(bounded_images,),
-        method='backward',
-    )
-    return lower, upper
 
 
 def sign_bits(values):
@@ -117,7 +100,8 @@ def possible_bit_assignments(lower, upper):
 def verify_example(model, model_type, image_pair, target, eps):
     images = image_pair.unsqueeze(0)
     prefix = PairModel(model, model_type).cpu().eval()
-    lower, upper = bounds_for_inputs(prefix, images, eps)
+    config = ConfigBuilder.from_defaults().set('general/device', 'cpu')
+    symbolic_input = input_vars((2, 28, 28))
 
     with torch.no_grad():
         clean_features = prefix(images)
@@ -133,14 +117,45 @@ def verify_example(model, model_type, image_pair, target, eps):
     clean_correct = bool(torch.equal((clean_output.squeeze(0) >= 0).float(), target_bits))
 
     if model_type == 'baseline':
+        symbolic_output_vars = output_vars(5)
+        output_constraint = None
+        for index, value in enumerate(clean_output.squeeze(0).tolist()):
+            if value == 0:
+                return {
+                    'eps': eps,
+                    'clean_correct': clean_correct,
+                    'certified_stable': False,
+                    'certified_correct': False,
+                    'ambiguous_grounding_bits': 0,
+                    'status': 'clean-logit-zero',
+                }
+            condition = symbolic_output_vars[index] > 0 if value > 0 else symbolic_output_vars[index] < 0
+            output_constraint = condition if output_constraint is None else output_constraint & condition
+
+        constraints = solver_constraints(
+            images,
+            eps,
+            symbolic_input,
+            symbolic_output_vars,
+            IOConstraints,
+            output_constraint,
+        )
+        result = ABCrownSolver(prefix, symbolic_input, symbolic_output_vars, config=config).verify(
+            constraints=constraints,
+        )
+        stable = bool(result.success)
         clean_sign = sign_bits(clean_output.squeeze(0))
-        stable = bool(torch.all(
-            ((clean_sign > 0) & (lower.squeeze(0) > 0))
-            | ((clean_sign < 0) & (upper.squeeze(0) < 0))
-        ))
         certified_correct = stable and clean_correct
-        ambiguous_bits = int(((lower <= 0) & (upper >= 0)).sum().item())
+        status = result.status
+        ambiguous_bits = 0
     else:
+        symbolic_output_vars = output_vars(8)
+        constraints = solver_constraints(images, eps, symbolic_input, symbolic_output_vars, IOConstraints)
+        result = ABCrownSolver(prefix, symbolic_input, symbolic_output_vars, config=config).compute_bounds(
+            constraints=constraints,
+            objective=[symbolic_output_vars[index] for index in range(8)],
+        )
+        lower, upper = result.lower, result.upper
         clean_bits = sign_bits(clean_features.squeeze(0)) > 0
         assignments = list(possible_bit_assignments(lower.squeeze(0), upper.squeeze(0)))
         clean_symbolic = (clean_output.squeeze(0) >= 0)
@@ -154,6 +169,7 @@ def verify_example(model, model_type, image_pair, target, eps):
         stable = all_same
         certified_correct = all_correct
         ambiguous_bits = int(((lower <= 0) & (upper >= 0)).sum().item())
+        status = 'bounds-success' if result.success else 'bounds-failed'
 
     return {
         'eps': eps,
@@ -161,6 +177,7 @@ def verify_example(model, model_type, image_pair, target, eps):
         'certified_stable': stable,
         'certified_correct': certified_correct,
         'ambiguous_grounding_bits': ambiguous_bits,
+        'status': status,
     }
 
 
@@ -194,6 +211,7 @@ def main():
             'certified_stability': sum(result['certified_stable'] for result in results) / len(results),
             'certified_accuracy': sum(result['certified_correct'] for result in results) / len(results),
             'mean_ambiguous_bits': sum(result['ambiguous_grounding_bits'] for result in results) / len(results),
+            'statuses': ';'.join(sorted(set(result['status'] for result in results))),
         }
         rows.append(row)
         print(row)
