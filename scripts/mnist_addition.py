@@ -16,6 +16,12 @@ from torch.utils.data import TensorDataset
 
 from smtlayer import SMTLayer
 
+DEVICE = torch.device(
+    'cuda' if torch.cuda.is_available()
+    else 'mps' if torch.backends.mps.is_available()
+    else 'cpu'
+)
+
 class MNISTAddition(torch.utils.data.Dataset):
     def __init__(self, x_by_classes, label_pairs):
         super(MNISTAddition).__init__()
@@ -137,7 +143,7 @@ def get_dataloader(
     train_label_pairs, 
     test_label_pairs, 
     batch_size=128,
-    data_dir='/data/data'
+    data_dir='data/mnist'
 ):
 
     transform = torchvision.transforms.Compose([
@@ -183,8 +189,8 @@ def train_epoch(epoch_idx, model, optimizer, train_load, use_satlayer=True,
     
     for batch_idx, (data, target) in tloader:
 
-        (data1, data2), target = data, target.cuda()
-        data1, data2 = data1.cuda(), data2.cuda()
+        (data1, data2), target = data, target.to(DEVICE)
+        data1, data2 = data1.to(DEVICE), data2.to(DEVICE)
         data = (data1, data2)
         
         optimizer.zero_grad()
@@ -225,8 +231,8 @@ def test_epoch(epoch_idx, model, test_load, use_satlayer=True):
     for batch_idx, (data, target) in tloader:
         with torch.no_grad():
             
-            (data1, data2), target = data, target.cuda()
-            data1, data2 = data1.cuda(), data2.cuda()
+            (data1, data2), target = data, target.to(DEVICE)
+            data1, data2 = data1.to(DEVICE), data2.to(DEVICE)
             data = (data1, data2)
                         
             output = model(data, return_sat=use_satlayer, do_maxsat=True)
@@ -260,8 +266,8 @@ def pretrain(model, optimizer, train_load, epochs, clip_norm=None):
         
         for batch_idx, (data, target) in tloader:
 
-            (data1, data2), target = data, target.cuda()
-            data1, data2 = data1.cuda(), data2.cuda()
+            (data1, data2), target = data, target.to(DEVICE)
+            data1, data2 = data1.to(DEVICE), data2.to(DEVICE)
             data = (data1, data2)
             
             optimizer.zero_grad()
@@ -302,11 +308,12 @@ def train(model, optimizer, train_load, test_load, epochs,
                 sched.step()
 
         test_acc, test_loss = test_epoch(epoch, model, test_load, use_satlayer=use_satlayer)
+        times.append(elapsed)
 
         if train_acc > 0.999:
             break
 
-    return train_acc, test_acc, sum(times)/float(epochs)
+    return train_acc, test_acc, sum(times)/float(len(times))
 
 @click.command()
 @click.option('--lr', default=1., show_default=True, help='Learning rate.')
@@ -349,7 +356,7 @@ def main(
     times = []
 
     for i in range(trials):
-        model = MNISTAdder(use_maxsmt=maxsat_backward).cuda()
+        model = MNISTAdder(use_maxsmt=maxsat_backward).to(DEVICE)
         optimizer = optim.SGD([{'params': model.parameters(), 'lr': lr, 'momentum': 0.9, 'nesterov': True}])
         sched = torch.optim.lr_scheduler.OneCycleLR(optimizer, 
                                                     lr, 
@@ -368,7 +375,7 @@ def main(
         test_accs.append(test_acc)
         times.append(elapsed)
 
-        print('\n[{} of {trials}]: train={:.4}, test={:.4}, time={:.4}\n'.format(i, train_acc, test_acc, elapsed))
+        print('\n[{} of {}]: train={:.4}, test={:.4}, time={:.4}\n'.format(i + 1, trials, train_acc, test_acc, elapsed))
         print('-'*20)
 
     train_accs = np.array(train_accs)
