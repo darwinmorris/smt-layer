@@ -23,6 +23,8 @@ DEVICE = torch.device(
     else 'cpu'
 )
 
+print('Using device: {}'.format(DEVICE))
+
 class MNISTAddition(torch.utils.data.Dataset):
     def __init__(self, x_by_classes, label_pairs):
         super(MNISTAddition).__init__()
