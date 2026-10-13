@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "abcrown",
+    "auto-lirpa",
     "click>=8.5.0",
     "numpy>=2.0",
     "torch>=2.11.0",
@@ -20,6 +21,7 @@ dependencies = [
 
 [tool.uv.sources]
 abcrown = { git = "https://github.com/Verified-Intelligence/alpha-beta-CROWN.git" }
+auto-lirpa = { git = "https://github.com/Verified-Intelligence/auto_LiRPA.git", rev = "5a098e8f9fb5786a428a024981d833d303921f2d" }
 
 [tool.setuptools.packages.find]
 include = ["smtlayer*"]

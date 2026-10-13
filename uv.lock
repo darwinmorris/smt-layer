@@ -67,6 +67,20 @@ wheels = [
 ]
 
 [[package]]
+name = "auto-lirpa"
+version = "0.7.2"
+source = { git = "https://github.com/Verified-Intelligence/auto_LiRPA.git?rev=5a098e8f9fb5786a428a024981d833d303921f2d#5a098e8f9fb5786a428a024981d833d303921f2d" }
+dependencies = [
+    { name = "appdirs" },
+    { name = "graphviz" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "packaging" },
+    { name = "torch" },
+    { name = "tqdm" },
+]
+
+[[package]]
 name = "click"
 version = "8.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1294,6 +1308,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "abcrown" },
+    { name = "auto-lirpa" },
     { name = "click" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -1306,6 +1321,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "abcrown", git = "https://github.com/Verified-Intelligence/alpha-beta-CROWN.git" },
+    { name = "auto-lirpa", git = "https://github.com/Verified-Intelligence/auto_LiRPA.git?rev=5a098e8f9fb5786a428a024981d833d303921f2d" },
     { name = "click", specifier = ">=8.5.0" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "torch", specifier = ">=2.11.0" },
