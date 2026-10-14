@@ -172,3 +172,5 @@ smtlayer.egg-info/*
 *json
 
 *ses
+
+*.venv
