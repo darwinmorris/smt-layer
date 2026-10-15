@@ -166,3 +166,11 @@ tags
 build/*
 dist/*
 smtlayer.egg-info/*
+
+*csv
+
+*json
+
+*ses
+
+*.venv
