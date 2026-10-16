@@ -52,7 +52,10 @@ def parse_args():
     parser.add_argument('--example-timeout', type=float, default=180)
     parser.add_argument('--threads', type=int, default=2)
     parser.add_argument('--pgd-steps', type=int, default=40)
-    parser.add_argument('--pgd-restarts', type=int, default=5)
+    parser.add_argument('--pgd-restarts', type=int, default=18,
+                        help='Total PGD trajectories per task, shared across objectives (not per bit).')
+    parser.add_argument('--attack-only', action='store_true',
+                        help='Skip CROWN and attack every example independently of certification.')
     parser.add_argument('--pgd-step-size', type=float, default=0.0,
                         help='0 means eps/4; pixel intensities are in [0,1].')
     return parser.parse_args()
@@ -99,56 +102,79 @@ def full_logits(model, model_type, images, pair_model=None):
 def find_counterexample(model, model_type, images, clean_bits, eps, settings, pair_model=None):
     """PGD heuristic; only a verified change in full-model output counts as success."""
     if eps == 0:
-        return False, 0, 0.0
+        return False, 0, 0.0, {}
     start = time.monotonic()
     original = images.detach()
     low, high = (original - eps).clamp(0, 1), (original + eps).clamp(0, 1)
     step_size = settings['pgd_step_size'] or eps / 4
-    clean_bits_tensor = torch.tensor(clean_bits, dtype=torch.float32)
-    # SMT: target extractor bits, NOT the non-differentiable symbolic layer.
-    if model_type != 'baseline':
-        with torch.no_grad():
-            extractor_clean = model.extractor(original.reshape(2, 1, 28, 28))
-            extractor_targets = (extractor_clean.reshape(-1) >= 0).float()
+    def attack_logits(x):
+        return (pair_model(x) if model_type == 'baseline' else
+                model.extractor(x.reshape(2, 1, 28, 28))).flatten()
+
+    with torch.no_grad():
+        clean_logits = attack_logits(original)
+        targets = (clean_logits >= 0).float()
+        signs = 2 * targets - 1
+    diagnostics = {
+        'attack_gradient_max': 0.0,
+        'attack_max_pixel_delta': 0.0,
+        'attack_clean_min_margin': float((signs * clean_logits).min()),
+        'attack_min_margin': float((signs * clean_logits).min()),
+        'attack_objective': '',
+    }
     evaluations = 0
+    # A fixed number of trajectories for every model. Cycle through BCE and
+    # individual margins rather than multiplying the budget by the bit count.
+    # Both images have the same perturbation freedom for all models.
+    generator = torch.Generator(device=original.device)
+    generator.manual_seed(settings.get('attack_seed', 0))
+    objectives = [None, *range(len(targets))]
+    diagnostics['attack_gradient_steps'] = 0
+    diagnostics['attack_max_evaluations'] = settings['pgd_restarts'] * (settings['pgd_steps'] + 1)
     for restart in range(settings['pgd_restarts']):
-        if restart == 0:
-            candidate = original.clone()
-        else:
-            candidate = original + torch.empty_like(original).uniform_(-eps, eps)
-            candidate = torch.maximum(torch.minimum(candidate, high), low)
+        bit_index = objectives[restart % len(objectives)]
+        objective = 'bce' if bit_index is None else f'bit_{bit_index}'
+        candidate = original.clone()
+        if restart:
+            noise = torch.empty_like(original).uniform_(-eps, eps, generator=generator)
+            candidate = torch.maximum(torch.minimum(original + noise, high), low)
         for step in range(settings['pgd_steps'] + 1):
-            # Evaluate *actual* full model, including SMT, before accepting a counterexample.
             with torch.no_grad():
+                logits = attack_logits(candidate)
+                if not torch.isfinite(logits).all():
+                    raise ValueError('Nonfinite attack logits')
+                diagnostics['attack_min_margin'] = min(
+                    diagnostics['attack_min_margin'], float((signs * logits).min()))
+                diagnostics['attack_max_pixel_delta'] = max(
+                    diagnostics['attack_max_pixel_delta'],
+                    float((candidate - original).abs().max()))
                 actual = full_logits(model, model_type, candidate, pair_model)
                 evaluations += 1
                 actual_bits = (actual.flatten() >= 0).int().tolist()
                 if actual_bits != clean_bits:
                     assert bool(((candidate - original).abs() <= eps + 1e-6).all())
                     assert bool((candidate >= 0).all() and (candidate <= 1).all())
-                    return True, evaluations, time.monotonic() - start
+                    diagnostics['attack_objective'] = objective
+                    return True, evaluations, time.monotonic() - start, diagnostics
             if step == settings['pgd_steps']:
                 break
             x = candidate.detach().requires_grad_(True)
-            if model_type == 'baseline':
-                logits = pair_model(x).flatten()
-                # Maximize loss relative to the CLEAN bit vector, to flip any bit.
-                loss = F.binary_cross_entropy_with_logits(logits, clean_bits_tensor,
-                                                          reduction='sum')
-            else:
-                logits = model.extractor(x.reshape(2, 1, 28, 28)).flatten()
-                # Surrogate: encourage any extractor bit to cross its clean sign.
-                loss = F.binary_cross_entropy_with_logits(logits, extractor_targets,
-                                                          reduction='sum')
+            logits = attack_logits(x)
+            loss = (F.binary_cross_entropy_with_logits(logits, targets, reduction='sum')
+                    if bit_index is None else -signs[bit_index] * logits[bit_index])
             gradient = torch.autograd.grad(loss, x)[0]
+            diagnostics['attack_gradient_steps'] += 1
+            if not torch.isfinite(gradient).all():
+                raise ValueError('Nonfinite attack gradient')
+            diagnostics['attack_gradient_max'] = max(
+                diagnostics['attack_gradient_max'], float(gradient.abs().max()))
             candidate = x.detach() + step_size * gradient.sign()
             candidate = torch.maximum(torch.minimum(candidate, high), low).detach()
-    return False, evaluations, time.monotonic() - start
+    return False, evaluations, time.monotonic() - start, diagnostics
 
 
 def verify_example(checkpoint, image, target, eps, settings):
     from scripts.mnist_addition import MNISTAdder
-    from auto_LiRPA import BoundedModule, BoundedTensor, PerturbationLpNorm
     torch.set_num_threads(settings['threads'])
     # Make attack restarts reproducible for a given task across resume runs.
     torch.manual_seed(settings['attack_seed'])
@@ -167,37 +193,43 @@ def verify_example(checkpoint, image, target, eps, settings):
         return dict(clean_correct=correct, certified_stable=True, certified_correct=correct,
                     ambiguous_bits=0, status='certified', lower_bounds='', upper_bounds='',
                     bound_seconds=0.0, attack_found=False, attack_evaluations=0,
-                    attack_seconds=0.0)
+                    attack_seconds=0.0, empirical_correct=correct, attack_completed=True,
+                    certification_evaluated=True)
 
-    bound_input = images if model_type == 'baseline' else images.reshape(2, 1, 28, 28)
-    prefix = pair_model if model_type == 'baseline' else model.extractor
-    start = time.monotonic()
-    bounded = BoundedModule(prefix, bound_input, device='cpu', bound_opts={
-        'sparse_intermediate_bounds': False,
-        'optimize_bound_args': {'iteration': settings['alpha_iterations'],
-                                'max_time': settings['alpha_max_time']},
-    })
-    perturbation = PerturbationLpNorm(norm=float('inf'), eps=eps,
-                                    x_L=(bound_input-eps).clamp(0, 1),
-                                    x_U=(bound_input+eps).clamp(0, 1))
-    lower, upper = bounded.compute_bounds(
-        x=(BoundedTensor(bound_input, perturbation),), method=settings['bound_method'])
-    bound_seconds = time.monotonic() - start
-    if (lower is None or upper is None or not torch.isfinite(lower).all()
-            or not torch.isfinite(upper).all() or not (lower <= upper).all()):
-        raise ValueError('Invalid or missing bounds')
-    lo, hi = lower.detach().flatten().tolist(), upper.detach().flatten().tolist()
-    ambiguous = sum(l < 0 <= u for l, u in zip(lo, hi))
-    if model_type == 'baseline':
-        stable = all(l >= 0 if b else u < 0 for b, l, u in zip(clean_bits, lo, hi))
-    else:
-        stable = all(sum_bits(a) == clean_bits for a in possible_bit_assignments(lo, hi))
+    stable = False
+    lo, hi, ambiguous, bound_seconds = [], [], '', 0.0
+    if not settings.get('attack_only', False):
+        from auto_LiRPA import BoundedModule, BoundedTensor, PerturbationLpNorm
+        bound_input = images if model_type == 'baseline' else images.reshape(2, 1, 28, 28)
+        prefix = pair_model if model_type == 'baseline' else model.extractor
+        start = time.monotonic()
+        bounded = BoundedModule(prefix, bound_input, device='cpu', bound_opts={
+            'sparse_intermediate_bounds': False,
+            'optimize_bound_args': {'iteration': settings['alpha_iterations'],
+                                    'max_time': settings['alpha_max_time']},
+        })
+        perturbation = PerturbationLpNorm(norm=float('inf'), eps=eps,
+                                        x_L=(bound_input-eps).clamp(0, 1),
+                                        x_U=(bound_input+eps).clamp(0, 1))
+        lower, upper = bounded.compute_bounds(
+            x=(BoundedTensor(bound_input, perturbation),), method=settings['bound_method'])
+        bound_seconds = time.monotonic() - start
+        if (lower is None or upper is None or not torch.isfinite(lower).all()
+                or not torch.isfinite(upper).all() or not (lower <= upper).all()):
+            raise ValueError('Invalid or missing bounds')
+        lo, hi = lower.detach().flatten().tolist(), upper.detach().flatten().tolist()
+        ambiguous = sum(l < 0 <= u for l, u in zip(lo, hi))
+        if model_type == 'baseline':
+            stable = all(l >= 0 if b else u < 0 for b, l, u in zip(clean_bits, lo, hi))
+        else:
+            stable = all(sum_bits(a) == clean_bits for a in possible_bit_assignments(lo, hi))
 
     # An attack is unnecessary for a certified-stable example. Search only
     # among inconclusive cases, and distinguish counterexamples from unknowns.
     attack_found, attack_evaluations, attack_seconds = (False, 0, 0.0)
+    attack_diagnostics = {}
     if not stable:
-        attack_found, attack_evaluations, attack_seconds = find_counterexample(
+        attack_found, attack_evaluations, attack_seconds, attack_diagnostics = find_counterexample(
             model, model_type, images, clean_bits, eps, settings, pair_model)
     return dict(clean_correct=correct, certified_stable=stable,
                 certified_correct=correct and stable, ambiguous_bits=ambiguous,
@@ -205,7 +237,10 @@ def verify_example(checkpoint, image, target, eps, settings):
                         'counterexample' if attack_found else 'inconclusive'),
                 lower_bounds=json.dumps(lo), upper_bounds=json.dumps(hi),
                 bound_seconds=bound_seconds, attack_found=attack_found,
-                attack_evaluations=attack_evaluations, attack_seconds=attack_seconds)
+                attack_evaluations=attack_evaluations, attack_seconds=attack_seconds,
+                empirical_correct=correct and not attack_found, attack_completed=True,
+                certification_evaluated=not settings.get('attack_only', False),
+                **attack_diagnostics)
 
 
 def worker(result_queue, checkpoint_path, image, target, eps, settings, log_path):
@@ -253,7 +288,10 @@ def run_task(checkpoint_path, image, target, eps, settings, log_path):
     return {'clean_correct': '', 'certified_stable': False, 'certified_correct': False,
             'ambiguous_bits': '', 'lower_bounds': '', 'upper_bounds': '',
             'bound_seconds': '', 'attack_found': False, 'attack_evaluations': 0,
-            'attack_seconds': '', 'error': '', **result,
+            'attack_seconds': '', 'attack_gradient_max': '', 'attack_max_pixel_delta': '',
+            'attack_clean_min_margin': '', 'attack_min_margin': '',
+            'attack_objective': '', 'attack_gradient_steps': 0, 'attack_max_evaluations': 0,
+            'empirical_correct': '', 'attack_completed': False, 'certification_evaluated': False, 'error': '', **result,
             'seconds': time.monotonic()-start}
 
 
@@ -284,6 +322,16 @@ def write_summary(path, records):
                          completed_examples=n, clean_evaluated=clean_evaluated,
                          clean_correct=clean_correct,
                          clean_accuracy=clean_correct/clean_evaluated if clean_evaluated else '',
+                         attack_completed=sum(r.get('attack_completed', False) for r in results),
+                         empirical_accuracy_completed=(
+                             sum(r.get('empirical_correct') is True for r in results) /
+                             sum(r.get('attack_completed', False) for r in results)
+                             if any(r.get('attack_completed', False) for r in results) else ''),
+                         certification_evaluated=sum(r.get('certification_evaluated', False) for r in results),
+                         attack_success_rate_clean_correct=(
+                             sum(r['clean_correct'] is True and r['attack_found'] for r in results) /
+                             sum(r['clean_correct'] is True and r.get('attack_completed', False) for r in results)
+                             if any(r['clean_correct'] is True and r.get('attack_completed', False) for r in results) else ''),
                          certified_stability=sum(r['certified_stable'] for r in results)/n,
                          certified_accuracy=sum(r['certified_correct'] for r in results)/n,
                          certified=sum(r['status']=='certified' for r in results),
@@ -328,7 +376,7 @@ def main():
     logs.mkdir(exist_ok=True)
     settings = {k: getattr(args, k) for k in
                 ['bound_method', 'alpha_iterations', 'alpha_max_time', 'example_timeout',
-                 'threads', 'pgd_steps', 'pgd_restarts', 'pgd_step_size']}
+                 'threads', 'pgd_steps', 'pgd_restarts', 'pgd_step_size', 'attack_only']}
     checkpoints = []
     for path in args.checkpoint:
         path = str(Path(path).resolve())
@@ -338,7 +386,7 @@ def main():
             raise ValueError('Only baseline, ordinary SMT, and digit-supervised checkpoints are supported.')
         checkpoints.append({'path': path, 'sha256': digest(path), 'model_type': kind})
     examples = load_test_examples(args.examples, args.sample_seed)
-    manifest = {'version': 2, 'script_sha256': digest(__file__), 'settings': settings,
+    manifest = {'version': 3, 'script_sha256': digest(__file__), 'settings': settings,
                 'checkpoints': checkpoints, 'eps': args.eps,
                 'sample_indices': [indices for _, _, indices in examples],
                 'sample_seed': args.sample_seed,
@@ -363,7 +411,7 @@ def main():
                         continue
                     print(f"{checkpoint['model_type']} eps={eps:.8g} example {index+1}/{len(examples)} starting (CPU)", flush=True)
                     log_path = logs / f'model{number}_example{index}_eps{eps:.8g}.log'
-                    task_settings = {**settings, 'attack_seed': args.sample_seed * 1000003 + index * 97 + number * 31 + round(eps * 255) * 13}
+                    task_settings = {**settings, 'attack_seed': args.sample_seed * 1000003 + index * 97 + round(eps * 255) * 13}
                     result = run_task(checkpoint['path'], image, target, eps, task_settings, str(log_path))
                     result = {'checkpoint': checkpoint['path'], 'model_type': checkpoint['model_type'],
                               'example_index': index, 'left_mnist_index': indices[0],
