@@ -133,3 +133,36 @@ If you use this code please cite
     url={https://openreview.net/forum?id=r8snfquzs3}
 }
 ```
+
+### Digit-supervised MNIST addition reference
+
+Train the same four-bit extractor with individual digit labels, then evaluate
+with the same SMT addition used by the sum-supervised SMT model:
+
+```bash
+uv run python -m scripts.mnist_addition --model digit --pct 100 --epochs 5 --seed 0
+```
+
+This uses the existing pair sampler and trains on eight operand bits with binary
+cross entropy. `--pct`, batch size, optimizer, and scheduler work as for the
+other models. Training accuracy measures exact correctness of both operand
+encodings; test accuracy measures the final sum. Checkpoints record these metric
+names and the stronger `digit_bits` supervision. Sum pretraining and MaxSAT flags
+are unsupported for this reference.
+
+Add the resulting checkpoint to either verification script's `--checkpoint` list:
+
+```bash
+uv run python scripts/verify_mnist_addition.py \
+  --checkpoint checkpoints/mnist_addition_baseline_pct100_seed0_trial1.pt \
+               checkpoints/mnist_addition_smt_pct100_seed0_trial1.pt \
+               checkpoints/mnist_addition_digit_pct100_seed0_trial1.pt \
+  --examples 5 --eps 0 0.003921568627 --output three_model_verification.csv
+```
+
+The digit model uses the same extractor bounds and symbolic sum checks as the
+SMT model. `scripts/verify_with_attacks.py` also accepts it and attacks its
+extractor, validating counterexamples against the final symbolic output.
+Use a fresh output filename after code changes because resume manifests include
+the verifier's script hash. This reference receives individual digit labels;
+the other models receive only sum labels.

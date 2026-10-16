@@ -125,6 +125,9 @@ def verify_example(checkpoint, image, target, eps, settings):
         raise ValueError('Invalid or missing bounds')
     lo, hi = lower.detach().flatten().tolist(), upper.detach().flatten().tolist()
     ambiguous = sum(l < 0 <= u for l, u in zip(lo, hi))
+    grounding_certified = (
+        ambiguous == 0 if model_type == 'smt' else None
+    )
     if model_type == 'baseline':
         stable = all(l >= 0 if b else u < 0 for b, l, u in zip(clean_bits, lo, hi))
     else:
@@ -246,8 +249,8 @@ def main():
         path = str(Path(path).resolve())
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         kind = checkpoint['model_type']
-        if kind not in ['baseline', 'smt'] or checkpoint.get('maxsat_forward', False):
-            raise ValueError('Only baseline and ordinary SMT checkpoints are supported.')
+        if kind not in ['baseline', 'smt', 'digit'] or checkpoint.get('maxsat_forward', False):
+            raise ValueError('Only baseline, ordinary SMT, and digit-supervised checkpoints are supported.')
         checkpoints.append({'path': path, 'sha256': digest(path), 'model_type': kind})
     examples = load_test_examples(args.examples, args.sample_seed)
     manifest = {'version': 1, 'script_sha256': digest(__file__), 'settings': settings,

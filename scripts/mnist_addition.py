@@ -26,11 +26,12 @@ DEVICE = torch.device(
 print('Using device: {}'.format(DEVICE))
 
 class MNISTAddition(torch.utils.data.Dataset):
-    def __init__(self, x_by_classes, label_pairs):
+    def __init__(self, x_by_classes, label_pairs, digit_supervision=False):
         super(MNISTAddition).__init__()
         
         self.by_classes = x_by_classes
         self.label_pairs = label_pairs
+        self.digit_supervision = digit_supervision
         
         self.len = sum([len(x_by_classes[cl]) for cl in x_by_classes])
         
@@ -46,6 +47,10 @@ class MNISTAddition(torch.utils.data.Dataset):
         inst1 = random.choice(self.by_classes[pair[0]]).unsqueeze(0)
         inst2 = random.choice(self.by_classes[pair[1]]).unsqueeze(0)
         
+        if self.digit_supervision:
+            # Four bits per operand, most significant bit first.
+            target = [int(bit) for digit in pair for bit in format(digit, '04b')]
+            return (inst1, inst2), torch.tensor(target, dtype=torch.float32)
         return (inst1, inst2), torch.tensor(self.bin_repr(sum(pair))).float()
 
 class MNISTExtractor(nn.Module):
@@ -146,7 +151,8 @@ def get_dataloader(
     train_label_pairs, 
     test_label_pairs, 
     batch_size=128,
-    data_dir='data/mnist'
+    data_dir='data/mnist',
+    digit_supervision=False
 ):
 
     transform = torchvision.transforms.Compose([
@@ -172,7 +178,7 @@ def get_dataloader(
     x_tr_by_classes = {cl: x_train[y_train==cl] for cl in range(10)}
     x_te_by_classes = {cl: x_test[y_test==cl] for cl in range(10)}
 
-    train_data = MNISTAddition(x_tr_by_classes, train_label_pairs)
+    train_data = MNISTAddition(x_tr_by_classes, train_label_pairs, digit_supervision=digit_supervision)
     test_data = MNISTAddition(x_te_by_classes, test_label_pairs)
 
     train_load = torch.utils.data.DataLoader(train_data, batch_size=batch_size)
@@ -181,7 +187,7 @@ def get_dataloader(
     return train_load, test_load
 
 def train_epoch(epoch_idx, model, optimizer, train_load, use_satlayer=True,
-                clip_norm=None, sched=None, do_maxsat_forward=False):
+                clip_norm=None, sched=None, do_maxsat_forward=False, digit_supervision=False):
 
     tloader = tqdm(enumerate(train_load), total=len(train_load))
     acc_total = 0.
@@ -197,7 +203,8 @@ def train_epoch(epoch_idx, model, optimizer, train_load, use_satlayer=True,
         data = (data1, data2)
         
         optimizer.zero_grad()
-        output = model(data, return_sat=use_satlayer, do_maxsat=do_maxsat_forward)
+        output = model(data, return_sat=use_satlayer, do_maxsat=do_maxsat_forward,
+                       return_feats=digit_supervision)
         loss = F.binary_cross_entropy_with_logits(output, target)
         loss.backward()
         if clip_norm is not None:
@@ -293,7 +300,7 @@ def pretrain(model, optimizer, train_load, epochs, clip_norm=None):
 
 def train(model, optimizer, train_load, test_load, epochs,
           use_satlayer=True, clip_norm=None, sched=None, do_sched_batch=False,
-          do_maxsat_forward=None):
+          do_maxsat_forward=None, digit_supervision=False):
     
     times = []
     
@@ -302,11 +309,11 @@ def train(model, optimizer, train_load, test_load, epochs,
         if do_sched_batch:
             train_acc, train_loss, elapsed = train_epoch(epoch, model, optimizer, train_load, 
                                                 use_satlayer=use_satlayer, clip_norm=clip_norm, sched=sched,
-                                                do_maxsat_forward=do_maxsat_forward)
+                                                do_maxsat_forward=do_maxsat_forward, digit_supervision=digit_supervision)
         else:
             train_acc, train_loss, elapsed = train_epoch(epoch, model, optimizer, train_load, 
                                                 use_satlayer=use_satlayer, clip_norm=clip_norm, sched=None,
-                                                do_maxsat_forward=do_maxsat_forward)
+                                                do_maxsat_forward=do_maxsat_forward, digit_supervision=digit_supervision)
             if sched is not None:
                 sched.step()
 
@@ -319,8 +326,8 @@ def train(model, optimizer, train_load, test_load, epochs,
     return train_acc, test_acc, sum(times)/float(len(times))
 
 @click.command()
-@click.option('--model', type=click.Choice(['smt', 'baseline']), default='smt', show_default=True,
-              help='Model to train.')
+@click.option('--model', type=click.Choice(['smt', 'baseline', 'digit']), default='smt', show_default=True,
+              help='digit trains four-bit digit groundings with direct labels, then uses SMT addition.')
 @click.option('--lr', default=1., show_default=True, help='Learning rate.')
 @click.option('--pretrain_epochs', default=0, show_default=True, help='Number of pretraining epochs.')
 @click.option('--pct', default=10, show_default=True, help='% pairs to use in training data.')
@@ -348,6 +355,11 @@ def main(
     checkpoint_dir='checkpoints'
 ):
 
+    if model == 'digit' and (pretrain_epochs or maxsat_forward or maxsat_backward):
+        raise click.UsageError('digit uses only digit supervision; pretraining and MaxSAT flags are unsupported.')
+    if min(epochs, batch_size, trials) < 1:
+        raise click.UsageError('epochs, batch_size, and trials must be positive.')
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -359,7 +371,9 @@ def main(
         train_label_pairs = [(0,0), (1,1), (2,2), (3,3), (4,4), (5,5), (6,6), (7,7), (8,8), (9,9)]
     else:
         train_label_pairs = test_label_pairs[:int(pct)]
-    train_load, test_load = get_dataloader(train_label_pairs, test_label_pairs, batch_size=batch_size)
+    train_load, test_load = get_dataloader(
+        train_label_pairs, test_label_pairs, batch_size=batch_size,
+        digit_supervision=model == 'digit')
     pretrain_load, _ = get_dataloader(train_label_pairs, test_label_pairs, batch_size=512)
 
     print('')
@@ -388,7 +402,8 @@ def main(
         pretrain(model_instance, optimizer, train_load, pretrain_epochs, clip_norm=clip_norm)
         train_acc, test_acc, elapsed = train(
             model_instance, optimizer, train_load, test_load, epochs,
-            use_satlayer=model == 'smt',
+            use_satlayer=model != 'baseline',
+            digit_supervision=model == 'digit',
             clip_norm=clip_norm, sched=sched, do_sched_batch=True,
             do_maxsat_forward=maxsat_forward if model == 'smt' else False
         )
@@ -413,6 +428,9 @@ def main(
             'clip_norm': clip_norm,
             'maxsat_forward': maxsat_forward if model == 'smt' else False,
             'maxsat_backward': maxsat_backward if model == 'smt' else False,
+            'supervision': 'digit_bits' if model == 'digit' else 'sum_bits',
+            'train_accuracy_metric': 'pair_grounding' if model == 'digit' else 'sum',
+            'test_accuracy_metric': 'sum',
             'train_accuracy': float(train_acc),
             'test_accuracy': float(test_acc),
             'epoch_time': float(elapsed),
