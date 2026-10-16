@@ -92,7 +92,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', nargs='+', required=True)
     parser.add_argument('--examples', type=int, default=100)
-    parser.add_argument('--eps', type=float, nargs='+', default=[0.0, 1 / 255, 2 / 255, 4 / 255, 8 / 255])
+    parser.add_argument('--eps', type=float, nargs='+', default=[0.0, 1 / 255, 2 / 255, 3/255,  4 / 255, 5/255, 6/255, 8 / 255])
     parser.add_argument('--output', default='verification_results.csv')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--timeout', type=float, default=60, help='BaB timeout per verify call, in seconds')
