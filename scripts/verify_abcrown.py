@@ -10,6 +10,7 @@ in <output>.resume.json and per-example rows in <output stem>_examples.csv.
 """
 import argparse
 import csv
+import gc
 import hashlib
 import itertools
 import json
@@ -98,6 +99,11 @@ def parse_args():
     parser.add_argument('--timeout', type=float, default=60, help='BaB timeout per verify call, in seconds')
     parser.add_argument('--pgd-steps', type=int, default=100)
     parser.add_argument('--pgd-restarts', type=int, default=30)
+    parser.add_argument('--batch-size', type=int, default=64,
+                        help='BaB batch size (subdomains per GPU batch); halved automatically on CUDA OOM')
+    parser.add_argument('--max-vram-ratio', type=float, default=0.9,
+                        help='Fraction of GPU memory BaB may grow its batch into; '
+                             'lower it when several runs share one GPU')
     # The model's clean prediction (z3) always runs on CPU; this is only for abcrown.
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     return parser.parse_args()
@@ -159,7 +165,23 @@ def verify_example(solver, model_type, image_pair, clean_sum, target, eps):
     constraints = IOConstraints(lower=lower, upper=upper, clauses=[clauses])
     # Proving the clean sum is stable also proves correctness when the clean
     # prediction is right; when it is wrong, the clean point is a counterexample.
-    result = solver.verify(constraints=constraints)
+    # Retry with half the BaB batch size on CUDA OOM. return_reference=False keeps
+    # the solver from holding intermediate GPU tensors after the call.
+    retries = 0
+    while True:
+        try:
+            result = solver.verify(constraints=constraints, return_reference=False)
+            break
+        except torch.OutOfMemoryError:
+            batch_size = solver.config['solver']['batch_size']
+            if batch_size <= 1:
+                raise
+            solver.config['solver']['batch_size'] = max(1, batch_size // 2)
+            retries += 1
+            print('CUDA OOM; retrying with BaB batch size {}'.format(
+                solver.config['solver']['batch_size']), flush=True)
+        finally:
+            free_cuda_memory()
     # result.success is also True for 'falsified' (it only means "not unknown").
     stable = result.status == 'verified'
     clean_correct = clean_sum == target
@@ -169,7 +191,15 @@ def verify_example(solver, model_type, image_pair, clean_sum, target, eps):
         'certified_correct': stable and clean_correct,
         'status': result.status,
         'clauses': len(clauses),
+        'oom_retries': retries,
+        'batch_size': solver.config['solver']['batch_size'],
     }
+
+
+def free_cuda_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def digest(path):
@@ -269,7 +299,8 @@ def main():
         'script_sha256': digest(__file__),
         'checkpoints': [{k: c[k] for k in ['path', 'sha256', 'model_type']} for c in checkpoints],
         'settings': {k: getattr(args, k) for k in
-                     ['examples', 'seed', 'timeout', 'pgd_steps', 'pgd_restarts', 'device']},
+                     ['examples', 'seed', 'timeout', 'pgd_steps', 'pgd_restarts', 'device',
+                      'batch_size', 'max_vram_ratio']},
         'eps': eps_values,
     }
     if state_path.exists():
@@ -296,6 +327,8 @@ def main():
         .set('bab/timeout', args.timeout)
         .set('attack/pgd_steps', args.pgd_steps)
         .set('attack/pgd_restarts', args.pgd_restarts)
+        .set('solver/batch_size', args.batch_size)
+        .set('solver/batched_crown_auto_enlarge_max_vram_ratio', args.max_vram_ratio)
         # Bound first (CROWN/alpha-CROWN); attack only if that is inconclusive, then BaB.
         .set('attack/pgd_order', 'after')
     )
